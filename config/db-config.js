@@ -7,7 +7,7 @@ const connectDB = async ()=>{
         console.log("Database Connected");
     });
 
-    await mongoose.connect(`mongodb://127.0.0.1:27017/ai-qa`);
+    await mongoose.connect(`${process.env.MONGODB_URL}`);
     } catch (error) {
         console.log(error.message, ": Check mongoDb connection and also check your Internet connection!!!")
     }
