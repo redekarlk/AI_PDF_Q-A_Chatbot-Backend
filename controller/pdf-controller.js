@@ -74,7 +74,7 @@
 //       return res.status(400).json({ msg: "No file uploaded" });
 //     }
 
-    
+
 
 
 
@@ -195,10 +195,10 @@ export const uploadPDF = async (req, res) => {
       return res.status(400).json({ msg: "No file uploaded" });
     }
 
-    // 👉 1. Compute hash of uploaded PDF
+    // 1. Compute hash of uploaded PDF
     const hash = getFileHash(file.path);
 
-    // 👉 2. Check if this PDF already exists in DB for this user
+    // 2. Check if this PDF already exists in DB for this user
     const existing = await Document.findOne({ userId, hash });
 
     if (existing) {
@@ -221,72 +221,80 @@ export const uploadPDF = async (req, res) => {
       hash
     });
 
-    // 4. Extract text
-    const text = await extractTextFromPDF(file.path);
+    try {
+      // 4. Extract text
+      const text = await extractTextFromPDF(file.path);
 
-    // 5. Chunk text
-    const chunks = chunkText(text);
+      // 5. Chunk text
+      const chunks = chunkText(text); // Uses improved chunker defaults
 
-    // 6. Prepare Pinecone upsert
-    const index = pinecone.Index("pdf-rag");
-    const vectors = [];
+      // 6. Generate Embeddings (Batched for speed)
+      const vectors = [];
+      const EMBED_BATCH_SIZE = 5; // Process 5 chunks in parallel to speed up Gemini
 
-    let counter = 0;
-    for (const c of chunks) {
-      const embedding = await embedText(c);
+      for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
+        const batch = chunks.slice(i, i + EMBED_BATCH_SIZE);
 
-      try {
-        verifyEmbeddingDimension(embedding);
-      } catch (dimErr) {
-        await fs.unlink(file.path); // cleanup
-        return res.status(500).json({
-          msg: "Embedding dimension mismatch",
-          error: dimErr.message,
-          details: {
-            embeddingDimension: embedding?.length,
-            expectedDimension: PINECONE_DIMENSION
-          }
+        // Run batch in parallel
+        const batchPromises = batch.map(async (chunk, idx) => {
+          const embedding = await embedText(chunk);
+
+          // Verify dimension immediately
+          verifyEmbeddingDimension(embedding);
+
+          return {
+            id: `${doc._id}-${i + idx}`,
+            values: embedding,
+            metadata: { docId: String(doc._id), content: chunk }
+          };
         });
+
+        const batchVectors = await Promise.all(batchPromises);
+        vectors.push(...batchVectors);
       }
 
-      vectors.push({
-        id: `${doc._id}-${counter}`,
-        values: embedding,
-        metadata: { docId: String(doc._id), content: c }
+      // 7. Upsert to Pinecone (Batched for reliability)
+      const index = pinecone.Index("pdf-rag");
+      const UPSERT_BATCH_SIZE = 100; // Pinecone recommends batching upserts
+
+      for (let i = 0; i < vectors.length; i += UPSERT_BATCH_SIZE) {
+        const batch = vectors.slice(i, i + UPSERT_BATCH_SIZE);
+        await index.upsert(batch);
+      }
+
+      // 8. Delete original PDF
+      await fs.unlink(file.path);
+
+      return res.json({
+        msg: "PDF uploaded & processed successfully",
+        documentId: doc._id,
+        totalChunks: chunks.length,
+        reused: false
       });
 
-      counter++;
+    } catch (processError) {
+      // ROLLBACK: If anything fails after doc creation, delete the doc from DB
+      await Document.findByIdAndDelete(doc._id);
+
+      // Re-throw to be caught by outer catch for generic error handling
+      throw processError;
     }
-
-    // 7. Upsert to Pinecone
-    try {
-      await index.upsert(vectors);
-    } catch (pineErr) {
-      const message = pineErr.message || String(pineErr);
-
-      const embeddingDim = vectors[0]?.values?.length || null;
-
-      return res.status(500).json({
-        msg: "Pinecone error",
-        error: message,
-        details: {
-          embeddingDimension: embeddingDim,
-          expectedDimension: PINECONE_DIMENSION
-        }
-      });
-    }
-
-    //  8. Delete original PDF
-    await fs.unlink(file.path);
-
-    return res.json({
-      msg: "PDF uploaded & processed successfully",
-      documentId: doc._id,
-      totalChunks: chunks.length,
-      reused: false
-    });
 
   } catch (err) {
+    // Ensure file is deleted even on error
+    if (req.file?.path) {
+      try { await fs.unlink(req.file.path); } catch (e) { /* ignore */ }
+    }
+
+    // Handle specific dimension errors if they bubbled up
+    if (err.message && err.message.includes("dimension")) {
+      return res.status(500).json({
+        msg: "Embedding dimension mismatch",
+        error: err.message,
+        details: { expectedDimension: PINECONE_DIMENSION }
+      });
+    }
+
     return res.status(500).json({ msg: "Server error", error: err.message });
   }
 };
