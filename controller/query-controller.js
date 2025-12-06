@@ -64,12 +64,13 @@ export const queryPDF = async (req, res) => {
     const index = pinecone.Index("pdf-rag");
 
     // 1) Question → Embedding
-    const queryEmbedding = await embedText(question);
+    const queryEmbedding = await embedText(question, "query");
 
     // 2) Search Pinecone vectors
+    // Increased topK to 20 to retrieve more context for broad questions
     const result = await index.query({
       vector: queryEmbedding,
-      topK: 3,
+      topK: 20, 
       includeMetadata: true,
       filter: { docId: docId.toString() }
     });
@@ -81,8 +82,19 @@ export const queryPDF = async (req, res) => {
     // 3) Combine top chunks
     const context = result.matches.map(m => m.metadata.content).join("\n\n");
 
-    // 4) Ask Gemini using context
-    const answer = await askGemini(question, context);
+    // 3.5) Fetch previous conversation history (last 3 turns)
+    const previousHistory = await History.find({ userId, docId })
+      .sort({ createdAt: -1 })
+      .limit(5);
+    
+    // Reverse to chronological order and format
+    const historyText = previousHistory
+      .reverse()
+      .map(h => `User: ${h.question}\nAI: ${h.answer}`)
+      .join("\n\n");
+
+    // 4) Ask Gemini using context AND history
+    const answer = await askGemini(question, context, historyText);
 
     // 5) Save to history
     await History.create({
@@ -93,6 +105,9 @@ export const queryPDF = async (req, res) => {
       createdAt: new Date()
     });
 
+    // console.log("Generated answer:", answer);
+
+    // 6) Return answer
     res.json({
       answer,
       contextUsed: context,
